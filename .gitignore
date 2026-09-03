@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 数据一律不随仓库走（均在仓库之外）
+# ~/WeChatData/ 已位于项目外，无需 ignore；如需在仓库内放个人分支数据，务必先去除私人信息
+
+# macOS
+.DS_Store

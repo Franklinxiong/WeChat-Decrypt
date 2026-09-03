@@ -1,0 +1,5 @@
+{
+  "db_path": "/Users/xhw/WeChatData/analysis.db",
+  "decrypted_dir": "/Users/xhw/WeChatData/wechat_decrypted",
+  "note": "仓库不含任何数据。真实数据由用户在仓库之外生成（默认 ~/WeChatData/），经本配置指向。db_path 指向构建出的分析库；可通过环境变量 WE_CHAT_DB 覆盖。"
+}
