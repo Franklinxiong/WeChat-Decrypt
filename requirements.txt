@@ -2,3 +2,7 @@ streamlit>=1.30
 pandas>=2.0
 plotly>=5.18
 zstandard>=0.22
+jieba>=0.42
+wordcloud>=1.9
+matplotlib>=3.7
+snownlp>=0.12

@@ -8,3 +8,13 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# 解密密钥/中间产物一律不进仓库
+all_keys.json
+/temp/
+
+# 任何解密产物/明文库一律不得进仓库
+/decrypted/
+
+# 本地设计文档（含 AIGC 版权元数据）不随仓库走
+/docs/

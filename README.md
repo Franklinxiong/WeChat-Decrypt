@@ -44,13 +44,14 @@
 ```
 WeChat-Decrypt/
 ├── README.md
-├── requirements.txt            # 依赖（streamlit / pandas / plotly / zstandard）
+├── requirements.txt            # 依赖（streamlit / pandas / plotly / zstandard / jieba 等）
 ├── config.json                 # 数据路径配置（指向仓库之外）
-├── app.py                      # 本地 Web 界面入口
+├── app.py                      # 本地 Web 界面入口（14 个页签）
 ├── analysis/                   # 数据加载与统计模块
 │   ├── __init__.py
 │   ├── loader.py               # sqlite -> DataFrame
-│   ├── stats.py                # 统计聚合
+│   ├── stats.py                # 统计聚合（含词云/情感/双人关系/年度报告等）
+│   ├── distill.py              # 聊天人蒸馏：会话 -> 角色人设 SKILL.md
 │   └── export.py               # CSV 导出
 ├── scripts/
 │   └── build_analysis.py       # 原始库 -> analysis.db（正文解析/昵称群名映射）
@@ -148,10 +149,18 @@ streamlit run app.py
 |---|---|
 | 总览 | 消息数 / 会话数 / 发送者数 / 时间跨度，按天趋势，类型分布 |
 | 会话分析 | Top 会话（昵称/群名）、会话概览表 |
+| 行为洞察 | 发送行为聚合：频率、时段偏好、互动习惯 |
 | 时间趋势 | 按小时分布、按星期分布 |
 | 发送者 | 消息量排行（昵称）、发送明细表 |
 | 明细浏览 | 按会话 / 发送者筛选，查看正文 |
 | 导出 | 各数据表一键导出 CSV |
+| 年度报告 | 分章节深色卡片：总消息/字符/活跃天数/最佳好友/峰值日/连续/熬夜/关键词/收发比 |
+| 词云 | 全站 / 单会话 / 单发送者词云，支持蒙版形状，高频词 TopN |
+| 日历热力图 | GitHub 风格全年活跃方格，支持年份选择 |
+| 情感分析 | 文本消息逐月/逐周情感曲线、正负向占比、最甜/最丧月份 |
+| 个性关键词 | 每个发送者相对全站的 TF-IDF 独特词 + 常发高频词 |
+| 双人关系 | 双向往复节奏、应答耗时分布、月度轨迹、共同短语、长连击 |
+| 人设蒸馏 | 选定会话生成可植入 agent 平台的角色人设 SKILL（见下文「蒸馏」） |
 
 ---
 
@@ -189,6 +198,29 @@ A：本仓库的构建脚本与界面以 macOS 路径约定编写，跨平台使
 |---|---|
 | 解析 | Python 3.9+ / SQLite / zstandard |
 | 分析展示 | Streamlit / Pandas / Plotly |
+| 文本分析 | jieba（分词）/ SnowNLP（情感）/ 手写 TF-IDF |
+| 词云渲染 | wordcloud / matplotlib |
+
+---
+
+## 🧬 蒸馏：从聊天会话生成角色人设 SKILL
+
+「人设蒸馏」页签提供一项周边能力：选定某个聊天会话（好友单聊 / 群聊 / 自己）后，从该会话文本中提取角色特征，生成一份 agent 平台可识别的标准 `SKILL.md` 角色人设文档——即把一个人的说话风格"蒸馏"成可供 AI 模仿的指令。
+
+- **纯本地规则**：分词 / 词频 / 语气词 / 标点习惯 / 句长分布 / 活跃时段 / TF-IDF 独特词全部本地计算，**不依赖任何 LLM / API Key**，可离线运行
+- **产物形态**：标准 SKILL 文件夹（`SKILL.md` + `assets/`），拷入 agent 平台的 skills 目录即可被识别调用
+- **输出位置**：默认写至仓库外 `~/WeChatData/skills/<会话>/`，不进 Git（蒸馏产物含真实聊天文本摘录，遵循"数据不出库"约定）
+- **轻量脱敏**：风格例句中的姓名 / 手机号 / 微信号等自动打码
+
+## 📝 更新日志
+
+### 2026-09-07 · v0.2 增强分析 + 人设蒸馏
+
+- **新增 7 个页签**：年度报告、词云、日历热力图、情感分析、个性关键词（TF-IDF）、双人关系、人设蒸馏，连同既有页签共 14 个
+- **私聊方向判定修复**：基于 `real_sender_id` + Name2Id 反查精确判定私聊收发方向，私聊对方消息数由旧逻辑的 1285 条提升至 169135 条；群聊方向与旧逻辑 100% 一致
+- **pair_stats 修复**：修正双人关系统计把全库私聊本人消息误算入对话者会话内本人消息的问题，修复后与 SQL 直查逐条吻合
+- **全新依赖**：`jieba` / `wordcloud` / `matplotlib` / `snownlp`
+- **构建脚本**：新增 `--self-wxid` 参数（默认从账号目录自动推导本机 wxid）
 
 ---
 
@@ -204,4 +236,3 @@ A：本仓库的构建脚本与界面以 macOS 路径约定编写，跨平台使
 [badge-macos]: https://img.shields.io/badge/platform-macOS-333333?style=flat-square&logo=apple&logoColor=white
 [badge-python]: https://img.shields.io/badge/python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white
 [badge-license]: https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square
-*（内容由AI生成，仅供参考）*
