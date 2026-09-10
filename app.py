@@ -6,9 +6,11 @@
 """
 from __future__ import annotations
 
+import html
 import io
 import json
 import os
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
@@ -18,6 +20,7 @@ import analysis.distill as distill
 import analysis.export as export
 import analysis.loader as loader
 import analysis.stats as stats
+import analysis.voice_transcriber as voice_tr
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -94,6 +97,540 @@ def _wordcloud_bytes(wf: pd.DataFrame, max_words: int = 160) -> bytes:
     buf = io.BytesIO()
     wc.to_image().save(buf, format="PNG")
     return buf.getvalue()
+
+
+# =========================================================================
+# 语音转写页签（Tab15，最小侵入新增）
+# 仅读取/写入 analysis.db 的独立表 voice_transcripts，不触碰任何现有表。
+# 转写走 analysis.voice_transcriber（SILK 解码 + SenseVoice 离线转写）。
+# =========================================================================
+VOICE_TYPES = (6, 34)
+_VOICE_KEY_COLS = ["session_username", "local_id", "create_time"]
+_VOICE_DEFAULT_DECRYPTED = os.path.join(PROJECT_ROOT, "decrypted")
+
+
+def _voice_model_status(model_dir: str) -> tuple[bool, str]:
+    """检测 SenseVoice 模型文件是否齐全，仅检测不下载。"""
+    missing = [f for f in voice_tr.MODEL_FILES
+               if not os.path.isfile(os.path.join(model_dir, f))]
+    if not missing:
+        return True, f"模型已就绪：`{model_dir}`（model.int8.onnx + tokens.txt）"
+    return False, (
+        f"模型不完整，缺少 {len(missing)} 个文件：{', '.join(missing)}\n\n"
+        f"目录：`{model_dir}`\n\n首次使用需联网下载（约 245MB，可断点续传），下载后自动就绪。"
+    )
+
+
+def _voice_transcripts_df(db_path: str) -> pd.DataFrame:
+    """读取独立表 voice_transcripts（表不存在时返回空表，绝不建表/写入）。"""
+    cols = ["session", "local_id", "create_time", "voice_text"]
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            df = pd.read_sql_query(
+                "SELECT session, local_id, create_time, voice_text "
+                "FROM voice_transcripts",
+                conn,
+            )
+        finally:
+            conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+def _voice_upsert(db_path: str, session, lid, ct, text) -> None:
+    """幂等写入 voice_transcripts（与 scripts/transcribe_voice.py 同一 schema）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO voice_transcripts"
+            "(session, local_id, create_time, voice_text) VALUES (?,?,?,?)",
+            (session, lid, ct, text),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _voice_view(msgs: pd.DataFrame, trans: pd.DataFrame):
+    """把消息表语音行与转写表按 (session_username, local_id, create_time) 关联。"""
+    if msgs.empty or "local_type" not in msgs.columns:
+        empty = pd.DataFrame(columns=_VOICE_KEY_COLS + ["session_slot", "sender_slot"])
+        return empty, {"total": 0, "done": 0, "todo": 0}
+    vm = msgs[msgs["local_type"].isin(VOICE_TYPES)].copy()
+    if vm.empty:
+        return vm, {"total": 0, "done": 0, "todo": 0}
+    vm["_key"] = vm[_VOICE_KEY_COLS].astype(str).agg("|".join, axis=1)
+    if trans.empty:
+        vm["voice_text"] = None
+    else:
+        ts = trans.copy()
+        ts["_key"] = ts[["session", "local_id", "create_time"]].astype(str).agg("|".join, axis=1)
+        vm = vm.merge(ts[["_key", "voice_text"]], on="_key", how="left")
+    vm["status"] = vm["voice_text"].notna().map({True: "已转写", False: "未转写"})
+    stat = {
+        "total": int(len(vm)),
+        "done": int(vm["status"].eq("已转写").sum()),
+        "todo": int(vm["status"].eq("未转写").sum()),
+    }
+    return vm, stat
+
+
+def _voice_run_pending(db_path, pending, idx, transcriber, bar, status_el):
+    """在会话内逐条增量转写未转写语音，实时更新进度条与状态文案。"""
+    n = len(pending)
+    ok = fail = skip = 0
+    for i, row in enumerate(pending, 1):
+        session, lid, ct = row
+        try:
+            data = idx.get(session, lid, ct)
+            if not data:
+                skip += 1
+            else:
+                pcm, rate = voice_tr.decode_silk_to_pcm(data)
+                text = voice_tr.clean_sensevoice_text(
+                    transcriber.transcribe_pcm(pcm, rate))
+                _voice_upsert(db_path, session, lid, ct, text)
+                ok += 1
+                status_el.markdown(
+                    f"**正在转写 {i}/{n}** · 成功 {ok} / 失败 {fail} / 跳过 {skip}　"
+                    f"`{session}` #{lid} → {text[:40] or '（空识别）'}")
+        except Exception as exc:
+            fail += 1
+            status_el.markdown(
+                f"**正在转写 {i}/{n}** · 成功 {ok} / 失败 {fail} / 跳过 {skip}　"
+                f"`{session}` #{lid} 失败：{exc}")
+        bar.progress(min(i / n, 1.0))
+    return ok, fail, skip
+
+
+def _voice_tab(db_path: str, msgs: pd.DataFrame, sname, ndname,
+               decrypted: str, model_dir: str) -> None:
+    st.subheader("语音转写（微信语音 → 文字）")
+    st.caption("对解密库中的语音消息（SILK）做离线转写，结果写入 `analysis.db` 的独立表 "
+               "`voice_transcripts`，不触碰任何现有表。语音统计独立于侧边栏时间过滤。")
+    if "_voice_flash" in st.session_state:
+        st.success(st.session_state.pop("_voice_flash"))
+
+    # ---- 状态总览 ----
+    trans = _voice_transcripts_df(db_path)
+    vm, stat = _voice_view(msgs, trans)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("语音消息总数", f"{stat['total']:,}")
+    c2.metric("已转写", f"{stat['done']:,}")
+    c3.metric("未转写", f"{stat['todo']:,}")
+
+    # ---- 1) 模型管理 ----
+    st.divider()
+    st.markdown("**1. 模型管理**（SenseVoice 离线模型）")
+    m_ready, m_msg = _voice_model_status(model_dir)
+    if m_ready:
+        st.success(m_msg)
+    else:
+        st.warning(m_msg)
+        if st.button("下载模型（约 245MB，首次需联网）", type="primary"):
+            with st.spinner("正在下载模型（可断点续传，请耐心等待）..."):
+                try:
+                    voice_tr.ensure_model(model_dir)
+                except Exception as exc:
+                    st.error(f"下载失败：{exc}")
+                else:
+                    st.success("模型下载完成")
+            st.rerun()
+
+    # ---- 2) 转写操作区 ----
+    st.divider()
+    st.markdown("**2. 转写操作**")
+    if stat["todo"] == 0:
+        st.info("没有未转写的语音消息。")
+    else:
+        st.caption(f"当前有 **{stat['todo']:,}** 条未转写语音；全量转写耗时较长，"
+                   f"可先用「限量快速测试（10 条）」验证效果。")
+        col_a, col_b, _ = st.columns([1, 1, 3])
+        do_all = col_a.button(
+            f"开始转写（全部未转写，共 {stat['todo']:,} 条）", type="primary")
+        do_test = col_b.button("限量快速测试（10 条）")
+        if (do_all or do_test) and not m_ready:
+            st.error("模型未就绪，请先下载模型。")
+        elif do_all or do_test:
+            limit = 10 if do_test else None
+            pend = vm[vm["status"].eq("未转写")][_VOICE_KEY_COLS]
+            pend = pend.head(limit) if limit else pend
+            pending = [tuple(r) for r in pend.itertuples(index=False)]
+            if not pending:
+                st.info("没有可转写的语音消息。")
+            else:
+                if not os.path.isdir(decrypted):
+                    st.error(f"解密库目录不存在：`{decrypted}`")
+                else:
+                    with st.spinner("构建语音索引并加载模型（首次约数秒）..."):
+                        idx = voice_tr.VoiceIndex(os.path.join(decrypted, "message"))
+                        transcriber = voice_tr.SenseVoiceTranscriber(model_dir)
+                    bar = st.progress(0.0)
+                    status_el = st.empty()
+                    ok, fail, skip = _voice_run_pending(
+                        db_path, pending, idx, transcriber, bar, status_el)
+                    bar.progress(1.0)
+                    status_el.empty()
+                    st.session_state["_voice_flash"] = (
+                        f"转写完成：成功 {ok} / 失败 {fail} / 跳过 {skip}"
+                        f"（累计已转写 {stat['done'] + ok:,} 条）")
+                    st.rerun()
+
+    # ---- 3) 结果展示 ----
+    st.divider()
+    st.markdown("**3. 结果查看与导出**")
+    if vm.empty:
+        st.info("解码库中暂未发现语音消息（local_type 6 / 34）。")
+        return
+
+    scope = st.radio("筛选范围", ["全部语音", "未转写", "已转写"],
+                     horizontal=True, index=0, key="vt_scope")
+    sess_opts = sorted(vm["session_slot"].dropna().unique().tolist())
+    send_opts = sorted(vm["sender_slot"].dropna().unique().tolist())
+    c_s, c_e = st.columns(2)
+    sel_sess = c_s.selectbox(
+        "会话", ["全部"] + sess_opts, key="vt_sess",
+        format_func=lambda x: "全部" if x == "全部" else sname(x))
+    sel_send = c_e.selectbox(
+        "发送者", ["全部"] + send_opts, key="vt_send",
+        format_func=lambda x: "全部" if x == "全部" else ndname(x))
+    kw = st.text_input("搜索关键词（匹配转写文字 / 会话 / 发送者）",
+                       value="", key="vt_kw")
+
+    disp = vm.copy()
+    if scope == "未转写":
+        disp = disp[disp["status"].eq("未转写")]
+    elif scope == "已转写":
+        disp = disp[disp["status"].eq("已转写")]
+    if sel_sess != "全部":
+        disp = disp[disp["session_slot"].eq(sel_sess)]
+    if sel_send != "全部":
+        disp = disp[disp["sender_slot"].eq(sel_send)]
+    if kw.strip():
+        k = kw.strip()
+        sess_str = disp["session_slot"].map(lambda v: sname(v) if pd.notna(v) else "").astype(str)
+        send_str = disp["sender_slot"].map(lambda v: ndname(v) if pd.notna(v) else "").astype(str)
+        disp = disp[
+            disp["voice_text"].fillna("").str.contains(k, case=False, na=False)
+            | sess_str.str.contains(k, case=False)
+            | send_str.str.contains(k, case=False)
+        ]
+
+    if disp.empty:
+        st.info("没有符合筛选条件的语音消息。")
+    else:
+        disp = disp.sort_values("create_time", ascending=False)
+        show = pd.DataFrame({
+            "时间": pd.to_datetime(disp["create_time"], unit="s", errors="coerce"),
+            "会话": disp["session_slot"].map(lambda v: sname(v) if pd.notna(v) else "（无）"),
+            "发送者": disp["sender_slot"].map(lambda v: ndname(v) if pd.notna(v) else "（无）"),
+            "转写文字": disp["voice_text"].fillna("[语音]"),
+            "状态": disp["status"],
+        })
+        st.caption(f"当前筛选结果 {len(show):,} 条（最多展示前 2000 条）")
+        st.dataframe(show.head(2000), use_container_width=True, height=360)
+        csv_bytes = show.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "导出当前结果为 CSV（UTF-8-BOM）", data=csv_bytes,
+            file_name="voice_transcripts_filtered.csv", mime="text/csv")
+
+    # ---- 使用说明 ----
+    st.divider()
+    st.markdown("**4. 使用说明**")
+    st.markdown(
+        "1. **模型**：首次使用点击「下载模型」自动获取 SenseVoice 离线模型"
+        "（约 245MB，仅需联网一次）。\n"
+        "2. **快速测试**：建议先用「限量快速测试（10 条）」验证转写效果。\n"
+        "3. **全量转写**：「开始转写（全部未转写）」会逐条离线转写并实时显示进度，"
+        "耗时取决于语音数量，页面进度条会持续更新，请勿关闭页面。\n"
+        "4. **结果查看**：可按会话 / 发送者 / 关键词筛选，未转写消息显示 `[语音]`，"
+        "已转写显示真实文字；「导出 CSV」下载当前筛选结果。\n"
+        "5. 转写结果写入 `voice_transcripts` 独立表，本页签不修改也不覆盖任何现有数据表。"
+    )
+
+
+# =========================================================================
+# 导出页签（Tab7「导出」改造）：按联系人/会话导出，多格式 HTML/MD/TXT/CSV
+# 严格最小侵入：仅新增以下辅助函数并在 with tabs[6] 调用；
+# 原有「整表导出 CSV」能力保留在 expander 折叠区内。
+# =========================================================================
+_VOICE_TYPES_EXPORT = (6, 34)
+
+
+def _now_str() -> str:
+    import datetime
+    dt = datetime.datetime.now()
+    return f"{dt.year}-{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+
+
+def _fmt_ts(ts) -> str:
+    """Unix 秒 -> 本地时间字符串（容忍非法值）。"""
+    try:
+        dt = pd.to_datetime(int(ts), unit="s", errors="coerce")
+        if pd.isna(dt):
+            return "-"
+        return (f"{dt.year}-{dt.month:02d}-{dt.day:02d} "
+                f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}")
+    except Exception:
+        return "-"
+
+
+def _dialogue_frame(msgs: pd.DataFrame, trans: pd.DataFrame, session=None,
+                    sender=None, lo=None, hi=None,
+                    voice_mode: str = "含语音消息") -> pd.DataFrame:
+    """按条件过滤消息并合并语音转写，得到导出用 frame（新增 _content 列，向量化）。
+
+    - 文本消息：content_text 原样
+    - 语音消息(local_type in 6/34)：优先 voice_transcripts.voice_text，
+      未转写显示 "[语音未转写]"
+    """
+    m = msgs.copy()
+    if m.empty or "local_type" not in m.columns:
+        m["_content"] = []
+        return m
+    if voice_mode == "仅文本消息":
+        m = m[~m["local_type"].isin(_VOICE_TYPES_EXPORT)]
+    if session is not None:
+        m = m[m["session_slot"] == session]
+    if sender is not None:
+        m = m[m["sender_slot"] == sender]
+    if not m.empty and "create_time" in m.columns:
+        t = pd.to_numeric(m["create_time"], errors="coerce")
+        keep = pd.Series(True, index=m.index)
+        if lo is not None:
+            keep &= (t >= lo)
+        if hi is not None:
+            keep &= (t <= hi)
+        m = m[keep]
+    # 合并语音转写
+    if trans.empty:
+        m["voice_text"] = None
+    else:
+        ts = trans.copy()
+        m["_k"] = (m["session_username"].astype(str) + "|"
+                   + m["local_id"].astype(str) + "|"
+                   + m["create_time"].astype(str))
+        ts["_k"] = (ts["session"].astype(str) + "|"
+                    + ts["local_id"].astype(str) + "|"
+                    + ts["create_time"].astype(str))
+        m = m.merge(ts[["_k", "voice_text"]], on="_k", how="left")
+        m = m.drop(columns=["_k"])
+    # 向量化生成导出内容
+    voiced = m["local_type"].isin(_VOICE_TYPES_EXPORT) \
+        if "local_type" in m.columns else pd.Series(False, index=m.index)
+    txt = m["content_text"].fillna("").astype(str).str.strip()
+    vt = m["voice_text"].fillna("").astype(str).str.strip()
+    full = vt.where(vt != "", "[语音未转写]")
+    m["_content"] = txt.where(~voiced, full)
+    return m
+
+
+def _dialogue_html(frame, sname, ndname, session_label, title) -> str:
+    rows = [
+        "<!DOCTYPE html>",
+        '<html lang="zh-CN"><head><meta charset="utf-8">'
+        f"<title>{html.escape(title)}</title>",
+        "<style>"
+        "body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;"
+        "max-width:860px;margin:24px auto;padding:0 16px;color:#222;background:#fff;}"
+        "h1{font-size:22px;} .meta{color:#888;font-size:13px;}"
+        ".msg{margin:10px 0;padding:8px 12px;border-radius:8px;background:#f6f7f9;}"
+        ".msg.self{background:#e6f4ff;}"
+        ".msg .time{color:#999;font-size:12px;margin-right:8px;}"
+        ".msg .sender{font-weight:600;margin-right:6px;}"
+        ".msg.voice{border-left:3px solid #faad14;}"
+        ".msg.voice .content{color:#7a5c00;background:#fffbe6;padding:2px 6px;"
+        "border-radius:4px;}"
+        "</style></head><body>",
+    ]
+    rows.append(f"<h1>{html.escape(title)}</h1>")
+    rows.append(f"<p class='meta'>会话：{html.escape(str(session_label))} · "
+                f"共 {len(frame)} 条 · 导出时间：{_now_str()}</p>")
+    for _, row in frame.iterrows():
+        lt = row.get("local_type")
+        is_voice = lt in _VOICE_TYPES_EXPORT
+        is_self = bool(row.get("is_send"))
+        snd = row.get("sender_slot")
+        snd_name = html.escape(ndname(snd) if pd.notna(snd) else "（系统）")
+        cls = "msg" + (" voice" if is_voice else "") + (" self" if is_self else "")
+        t_s = _fmt_ts(row.get("create_time"))
+        content = html.escape(str(row.get("_content") or ""))
+        voicetag = '<span class="voice-tag">🎤 </span>' if is_voice else ""
+        rows.append(
+            f'<div class="{cls}"><span class="time">{t_s}</span>'
+            f'<span class="sender">{snd_name}</span>: {voicetag}'
+            f'<span class="content">{content}</span></div>'
+        )
+    rows.append("</body></html>")
+    return "\n".join(rows)
+
+
+def _dialogue_markdown(frame, sname, ndname, session_label, title) -> str:
+    out = [f"# {title}", "",
+           f"> 会话：{session_label} ｜ 共 {len(frame)} 条 ｜ {_now_str()}", ""]
+    for _, row in frame.iterrows():
+        snd = ndname(row.get("sender_slot")) \
+            if pd.notna(row.get("sender_slot")) else "（系统）"
+        ts = _fmt_ts(row.get("create_time"))
+        content = str(row.get("_content") or "")
+        tag = "🎤 " if row.get("local_type") in _VOICE_TYPES_EXPORT else ""
+        out.append(f"- **{ts}**　**{snd}**：{tag}{content}")
+    return "\n".join(out)
+
+
+def _dialogue_txt(frame, sname, ndname, session_label, title) -> str:
+    out = [f"微信聊天记录 - {title}",
+           f"会话：{session_label}  共 {len(frame)} 条  {_now_str()}",
+           "-" * 48]
+    for _, row in frame.iterrows():
+        snd = ndname(row.get("sender_slot")) \
+            if pd.notna(row.get("sender_slot")) else "（系统）"
+        ts = _fmt_ts(row.get("create_time"))
+        content = str(row.get("_content") or "")
+        prefix = "[语音] " if row.get("local_type") in _VOICE_TYPES_EXPORT else ""
+        out.append(f"[{ts}] {snd}: {prefix}{content}")
+    return "\n".join(out)
+
+
+def _dialogue_csv_bytes(frame, sname, ndname, session_label) -> bytes:
+    out = pd.DataFrame({
+        "时间": frame["create_time"].map(_fmt_ts),
+        "会话": frame["session_slot"].map(
+            lambda v: sname(v) if pd.notna(v) else "（无）"),
+        "发送者": frame["sender_slot"].map(
+            lambda v: ndname(v) if pd.notna(v) else "（系统）"),
+        "类型": frame["local_type"],
+        "内容": frame["_content"],
+    })
+    return out.to_csv(index=False).encode("utf-8-sig")
+
+
+def _export_tab(db_path: str, msgs: pd.DataFrame, dfs: dict, sel, sname, ndname) -> None:
+    st.subheader("导出聊天记录")
+    st.caption("按联系人/会话导出为 HTML / Markdown / TXT / CSV。"
+               "语音消息自动合并转写文字，未转写显示「[语音未转写]」。")
+    if msgs.empty or "session_slot" not in msgs.columns or "session_username" not in msgs.columns:
+        st.info("消息数据不可用（缺少 session 相关列）。可先在「数据源」内生成分析库。")
+        return
+
+    # ---- 会话选择（可搜索） ----
+    sess_opts = sorted(msgs["session_slot"].dropna().unique().tolist())
+    sel_sess = st.selectbox(
+        "选择会话（可输入搜索）", [None] + sess_opts,
+        format_func=lambda x: "全部会话" if x is None else sname(x),
+        key="ex_sess")
+
+    # ---- 发送者过滤 ----
+    base = msgs if sel_sess is None else msgs[msgs["session_slot"] == sel_sess]
+    send_opts = sorted(base["sender_slot"].dropna().unique().tolist())
+    sel_send = st.selectbox(
+        "发送者过滤", [None] + send_opts,
+        format_func=lambda x: "全部发送者" if x is None else ndname(x),
+        key="ex_send")
+
+    # ---- 时间范围 ----
+    ts_series = pd.to_numeric(msgs["create_time"], errors="coerce").dropna()
+    time_desc = "全部"
+    lo = hi = None
+    if not ts_series.empty:
+        mn_dt = pd.to_datetime(ts_series.min(), unit="s", utc=True).tz_convert(None)
+        mx_dt = pd.to_datetime(ts_series.max(), unit="s", utc=True).tz_convert(None)
+        use_side = st.checkbox("使用侧边栏时间范围", value=sel is not None,
+                               key="ex_uside")
+        if use_side and sel is not None:
+            lo = int(pd.Timestamp(sel[0]).timestamp() - 12 * 3600)
+            hi = int(pd.Timestamp(sel[1] + pd.Timedelta(days=1)).timestamp())
+            time_desc = f"{sel[0]} ~ {sel[1]}（跟随侧边栏）"
+        else:
+            d1, d2 = st.date_input(
+                "自定义时间范围", value=(mn_dt.date(), mx_dt.date()),
+                min_value=mn_dt.date(), max_value=mx_dt.date(), key="ex_range")
+            lo = int(pd.Timestamp(d1).timestamp() - 12 * 3600)
+            hi = int(pd.Timestamp(d2 + pd.Timedelta(days=1)).timestamp())
+            time_desc = f"{d1} ~ {d2}"
+    st.caption(f"时间范围：{time_desc}")
+
+    # ---- 消息范围 / 格式 ----
+    voice_mode = st.radio("消息范围", ["含语音消息", "仅文本消息"],
+                          horizontal=True, index=0, key="ex_voice")
+    fmt = st.selectbox("导出格式", ["HTML", "Markdown", "TXT", "CSV"],
+                       key="ex_fmt")
+
+    # ---- 预览 ----
+    trans = _voice_transcripts_df(db_path)
+    pv = _dialogue_frame(msgs, trans, session=sel_sess, sender=sel_send,
+                         lo=lo, hi=hi, voice_mode=voice_mode)
+    st.markdown("**预览（前 20 条）**")
+    st.caption(f"当前筛选范围内共 {len(pv):,} 条消息（预览仅显示前 20 条）")
+    if pv.empty:
+        st.info("当前条件下没有消息。")
+    else:
+        pm = pv.head(20).copy()
+        view = pd.DataFrame({
+            "时间": pm["create_time"].map(_fmt_ts),
+            "会话": pm["session_slot"].map(
+                lambda v: sname(v) if pd.notna(v) else "（无）"),
+            "发送者": pm["sender_slot"].map(
+                lambda v: ndname(v) if pd.notna(v) else "（系统）"),
+            "内容": pm["_content"],
+        })
+        st.dataframe(view, use_container_width=True)
+
+    # ---- 生成与下载 ----
+    if st.button("生成导出文件", type="primary", key="ex_gen"):
+        if pv.empty:
+            st.warning("当前条件下没有可导出的消息。")
+        else:
+            title = (f"微信聊天记录 - {sname(sel_sess)}"
+                     if sel_sess is not None else "微信聊天记录 - 全部会话")
+            session_label = sname(sel_sess) if sel_sess is not None else "全部会话"
+            slug = str(sel_sess) if sel_sess is not None else "all"
+            if fmt == "HTML":
+                data = _dialogue_html(pv, sname, ndname, session_label, title).encode("utf-8")
+                fname = f"chat_{slug}.html"
+                mime = "text/html"
+            elif fmt == "Markdown":
+                data = _dialogue_markdown(pv, sname, ndname, session_label, title).encode("utf-8")
+                fname = f"chat_{slug}.md"
+                mime = "text/markdown"
+            elif fmt == "TXT":
+                data = _dialogue_txt(pv, sname, ndname, session_label, title).encode("utf-8")
+                fname = f"chat_{slug}.txt"
+                mime = "text/plain"
+            else:
+                data = _dialogue_csv_bytes(pv, sname, ndname, session_label)
+                fname = f"chat_{slug}.csv"
+                mime = "text/csv"
+            st.session_state["_ex_payload"] = (data, fname, mime, len(pv))
+            st.rerun()
+
+    pl = st.session_state.pop("_ex_payload", None)
+    if pl:
+        data, fname, mime, n = pl
+        st.success(f"已生成文件 `{fname}`（{n:,} 条）。改动筛选条件后请重新「生成导出文件」。")
+        st.download_button("下载导出文件", data=data, file_name=fname,
+                           mime=mime, key="ex_dl")
+
+    # ---- 附属：保留原有整表导出（折叠） ----
+    with st.expander("原有功能：整表导出 CSV"):
+        table_map = {
+            "sessions 会话": "sessions",
+            "contacts 联系人": "contacts",
+            "senders 发送者": "senders",
+            "messages 消息明细": "messages",
+        }
+        choice = st.selectbox("选择数据表", list(table_map.keys()), key="ex_table")
+        out_df = dfs.get(table_map[choice], pd.DataFrame())
+        if out_df.empty:
+            st.info("该表为空")
+        else:
+            fname = f"{table_map[choice]}.csv"
+            buf = io.StringIO()
+            out_df.to_csv(buf, index=False, encoding="utf-8-sig")
+            st.download_button("下载 CSV", data=buf.getvalue(),
+                               file_name=fname, mime="text/csv")
 
 
 def main() -> None:
@@ -174,6 +711,7 @@ def main() -> None:
     tabs = st.tabs([
         "总览", "会话分析", "行为洞察", "时间趋势", "发送者", "明细浏览", "导出",
         "年度报告", "词云", "日历热力图", "情感分析", "个性关键词", "双人关系", "人设蒸馏",
+        "语音转写",
     ])
 
     # ---- Tab1 总览 ----
@@ -383,22 +921,7 @@ def main() -> None:
 
     # ---- Tab7 导出 ----
     with tabs[6]:
-        st.subheader("导出数据表为 CSV")
-        table_map = {
-            "sessions 会话": "sessions",
-            "contacts 联系人": "contacts",
-            "senders 发送者": "senders",
-            "messages 消息明细": "messages",
-        }
-        choice = st.selectbox("选择数据表", list(table_map.keys()))
-        out_df = dfs_f.get(table_map[choice], pd.DataFrame())
-        if out_df.empty:
-            st.info("该表为空")
-        else:
-            fname = f"{table_map[choice]}.csv"
-            buf = io.StringIO()
-            out_df.to_csv(buf, index=False, encoding="utf-8-sig")
-            st.download_button("下载 CSV", data=buf.getvalue(), file_name=fname, mime="text/csv")
+        _export_tab(db_path, msgs, dfs, sel, sname, ndname)
 
     # ---- Tab8 年度报告 ----
     with tabs[7]:
@@ -671,6 +1194,17 @@ def main() -> None:
                         f"- 样本：{sm['text_messages']} 条文本 / {sm['total_chars']} 字\n"
                         f"- Top 用词：{' '.join(sm['top_words'])}"
                     )
+
+    # ---- Tab15 语音转写（新增页签，不影响上方 14 页签） ----
+    with tabs[14]:
+        _voice_tab(
+            db_path,
+            msgs,  # 全量消息：语音统计独立于侧边栏时间过滤
+            sname,
+            ndname,
+            decrypted=_VOICE_DEFAULT_DECRYPTED,
+            model_dir=voice_tr.DEFAULT_MODEL_DIR,
+        )
 
     # 底部说明 -------------------------------------------------
     st.divider()

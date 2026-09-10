@@ -6,3 +6,8 @@ jieba>=0.42
 wordcloud>=1.9
 matplotlib>=3.7
 snownlp>=0.12
+# --- 语音消息转文字（voice_transcriber.py / transcribe_voice.py）---
+# 注: PyPI 的 pysilk 0.0.1 是空壳包（无可导入模块），故 SILK 解码采用 pilk（微信专用，
+# 自动处理 0x02232153 腾讯头）；pysilk-mod 可作为同等替代（import pysilk）。
+sherpa-onnx>=1.13.7          # SenseVoiceSmall 离线 ASR
+pilk>=0.2.4                  # SILK -> PCM 解码（微信语音专用）
